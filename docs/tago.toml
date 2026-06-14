@@ -1,0 +1,10 @@
+title       = "countriesnow"
+baseURL     = "https://countriesnow-cli.tamnd.com/"
+description = "Look up countries, capitals, currencies, flags, population, and cities."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/countriesnow-cli"
