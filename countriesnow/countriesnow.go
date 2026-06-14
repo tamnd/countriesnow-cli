@@ -1,62 +1,235 @@
 // Package countriesnow is the library behind the countriesnow command line:
-// the HTTP client, request shaping, and the typed data models for countriesnow.
+// the HTTP client, request shaping, and the typed data models for the
+// countriesnow.space API (country data: capitals, currencies, flags, population,
+// cities — no key required).
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client is the spine every command shares. It sets a real User-Agent,
+// paces requests so a busy session stays polite, and retries the transient
+// failures (429 and 5xx) that any public API throws under load.
 package countriesnow
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to countriesnow. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "countriesnow/dev (+https://github.com/tamnd/countriesnow-cli)"
+// Host is the API hostname this package talks to.
+const Host = "countriesnow.space"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at countriesnow.com; change it once you
-// know the real endpoints you want to read.
-const Host = "countriesnow.com"
-
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to countriesnow over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tuneable parameters for a Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
+// DefaultConfig returns the production configuration for countriesnow.space.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://countriesnow.space/api/v0.1",
+		UserAgent: "countriesnow-cli/0.1.0 (github.com/tamnd/countriesnow-cli)",
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// CountryInfo holds merged data from multiple endpoints about one country.
+type CountryInfo struct {
+	Name     string `json:"name"`
+	Capital  string `json:"capital,omitempty"`
+	Currency string `json:"currency,omitempty"`
+	ISO2     string `json:"iso2,omitempty"`
+	ISO3     string `json:"iso3,omitempty"`
+	Flag     string `json:"flag,omitempty"`
+}
+
+// PopYear is one year's population count.
+type PopYear struct {
+	Year  int `json:"year"`
+	Value int `json:"value"`
+}
+
+// CountryPop holds population data for one country.
+type CountryPop struct {
+	Country          string    `json:"country"`
+	PopulationCounts []PopYear `json:"populationCounts"`
+	LatestYear       int       `json:"latest_year,omitempty"`
+	LatestValue      int       `json:"latest_value,omitempty"`
+}
+
+// Client talks to countriesnow.space over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured from cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.Timeout}}
+}
+
+// raw API envelope.
+type apiEnvelope struct {
+	Error bool            `json:"error"`
+	Msg   string          `json:"msg"`
+	Data  json.RawMessage `json:"data"`
+}
+
+// Capitals returns a list of countries with their capitals.
+func (c *Client) Capitals(ctx context.Context, limit int) ([]CountryInfo, error) {
+	type item struct {
+		Name    string `json:"name"`
+		Capital string `json:"capital"`
+		ISO2    string `json:"iso2"`
+		ISO3    string `json:"iso3"`
+	}
+	body, err := c.get(ctx, c.cfg.BaseURL+"/countries/capital")
+	if err != nil {
+		return nil, err
+	}
+	var env apiEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("countriesnow: decode capitals: %w", err)
+	}
+	var items []item
+	if err := json.Unmarshal(env.Data, &items); err != nil {
+		return nil, fmt.Errorf("countriesnow: decode capitals data: %w", err)
+	}
+	out := make([]CountryInfo, 0, len(items))
+	for i, it := range items {
+		if limit > 0 && i >= limit {
+			break
+		}
+		out = append(out, CountryInfo{Name: it.Name, Capital: it.Capital, ISO2: it.ISO2, ISO3: it.ISO3})
+	}
+	return out, nil
+}
+
+// Currencies returns a list of countries with their currencies.
+func (c *Client) Currencies(ctx context.Context, limit int) ([]CountryInfo, error) {
+	type item struct {
+		Name     string `json:"name"`
+		Currency string `json:"currency"`
+		ISO2     string `json:"iso2"`
+		ISO3     string `json:"iso3"`
+	}
+	body, err := c.get(ctx, c.cfg.BaseURL+"/countries/currency")
+	if err != nil {
+		return nil, err
+	}
+	var env apiEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("countriesnow: decode currencies: %w", err)
+	}
+	var items []item
+	if err := json.Unmarshal(env.Data, &items); err != nil {
+		return nil, fmt.Errorf("countriesnow: decode currencies data: %w", err)
+	}
+	out := make([]CountryInfo, 0, len(items))
+	for i, it := range items {
+		if limit > 0 && i >= limit {
+			break
+		}
+		out = append(out, CountryInfo{Name: it.Name, Currency: it.Currency, ISO2: it.ISO2, ISO3: it.ISO3})
+	}
+	return out, nil
+}
+
+// Flags returns a list of countries with their flag image URLs.
+func (c *Client) Flags(ctx context.Context, limit int) ([]CountryInfo, error) {
+	type item struct {
+		Name string `json:"name"`
+		Flag string `json:"flag"`
+	}
+	body, err := c.get(ctx, c.cfg.BaseURL+"/countries/flag/images")
+	if err != nil {
+		return nil, err
+	}
+	var env apiEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("countriesnow: decode flags: %w", err)
+	}
+	var items []item
+	if err := json.Unmarshal(env.Data, &items); err != nil {
+		return nil, fmt.Errorf("countriesnow: decode flags data: %w", err)
+	}
+	out := make([]CountryInfo, 0, len(items))
+	for i, it := range items {
+		if limit > 0 && i >= limit {
+			break
+		}
+		out = append(out, CountryInfo{Name: it.Name, Flag: it.Flag})
+	}
+	return out, nil
+}
+
+// Population returns a list of countries with their latest population figure.
+func (c *Client) Population(ctx context.Context, limit int) ([]CountryPop, error) {
+	type item struct {
+		Country          string    `json:"country"`
+		PopulationCounts []PopYear `json:"populationCounts"`
+	}
+	body, err := c.get(ctx, c.cfg.BaseURL+"/countries/population")
+	if err != nil {
+		return nil, err
+	}
+	var env apiEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("countriesnow: decode population: %w", err)
+	}
+	var items []item
+	if err := json.Unmarshal(env.Data, &items); err != nil {
+		return nil, fmt.Errorf("countriesnow: decode population data: %w", err)
+	}
+	out := make([]CountryPop, 0, len(items))
+	for i, it := range items {
+		if limit > 0 && i >= limit {
+			break
+		}
+		cp := CountryPop{Country: it.Country, PopulationCounts: it.PopulationCounts}
+		// pick the most recent year's value
+		for _, py := range it.PopulationCounts {
+			if py.Year > cp.LatestYear {
+				cp.LatestYear = py.Year
+				cp.LatestValue = py.Value
+			}
+		}
+		out = append(out, cp)
+	}
+	return out, nil
+}
+
+// Cities returns the cities in a given country via a POST request.
+func (c *Client) Cities(ctx context.Context, country string) ([]string, error) {
+	body, err := c.post(ctx, c.cfg.BaseURL+"/countries/cities", map[string]string{"country": country})
+	if err != nil {
+		return nil, err
+	}
+	var env apiEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("countriesnow: decode cities: %w", err)
+	}
+	var cities []string
+	if err := json.Unmarshal(env.Data, &cities); err != nil {
+		return nil, fmt.Errorf("countriesnow: decode cities data: %w", err)
+	}
+	return cities, nil
+}
+
+func (c *Client) get(ctx context.Context, u string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +237,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, http.MethodGet, u, nil)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +246,51 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("countriesnow: get %s: %w", u, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) post(ctx context.Context, u string, payload any) ([]byte, error) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("countriesnow: marshal body: %w", err)
+	}
+	var lastErr error
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff(attempt)):
+			}
+		}
+		body, retry, err := c.do(ctx, http.MethodPost, u, b)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !retry {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("countriesnow: post %s: %w", u, lastErr)
+}
+
+func (c *Client) do(ctx context.Context, method, u string, payload []byte) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var bodyReader io.Reader
+	if payload != nil {
+		bodyReader = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, bodyReader)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -106,10 +312,12 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -121,80 +329,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on countriesnow.com. It is a stand-in for the typed records you
-// will model from the real countriesnow endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `countriesnow cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }

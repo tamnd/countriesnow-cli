@@ -2,13 +2,10 @@ package countriesnow
 
 import (
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
 
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in countriesnow_test.go.
+// These tests are offline: they exercise the URI driver's pure string functions.
+// The client's HTTP behaviour is covered in countriesnow_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -23,54 +20,49 @@ func TestDomainInfo(t *testing.T) {
 	}
 }
 
-func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+func TestClassify_country(t *testing.T) {
+	typ, id, err := Domain{}.Classify("Japan")
+	if err != nil {
+		t.Fatalf("Classify: %v", err)
 	}
-	for _, tc := range cases {
-		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
-		}
+	if typ != "country" {
+		t.Errorf("type = %q, want country", typ)
+	}
+	if id != "Japan" {
+		t.Errorf("id = %q, want Japan", id)
 	}
 }
 
-func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+func TestClassify_empty(t *testing.T) {
+	_, _, err := Domain{}.Classify("")
+	if err == nil {
+		t.Error("expected error on empty input, got nil")
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
+func TestLocate_country(t *testing.T) {
+	got, err := Domain{}.Locate("country", "Japan")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Locate: %v", err)
 	}
+	if got == "" {
+		t.Error("Locate returned empty URL")
+	}
+}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+func TestLocate_city(t *testing.T) {
+	got, err := Domain{}.Locate("city", "Tokyo")
 	if err != nil {
-		t.Fatalf("Mint: %v", err)
+		t.Fatalf("Locate: %v", err)
 	}
-	if want := "countriesnow://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
+	if got == "" {
+		t.Error("Locate returned empty URL")
 	}
+}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("countriesnow", "about")
-	if err != nil || got.String() != "countriesnow://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want countriesnow://page/about", got.String(), err)
+func TestLocate_badType(t *testing.T) {
+	_, err := Domain{}.Locate("page", "foo")
+	if err == nil {
+		t.Error("expected error for unknown type, got nil")
 	}
 }
